@@ -1,6 +1,6 @@
 [package]
 name = "vdisplay"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 authors = ["visiuun"]
 description = "Controller for the MARS GAMING MC-3TCORELCD (DS916) 360x960 case screen"

@@ -12,6 +12,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 pub const TASK_NAME: &str = "Vdisplay HWiNFO";
+/// Bumped when the task's action changes, so older tasks get set up again.
+const TASK_DESC: &str = "Starts HWiNFO sensors for Vdisplay (v2)";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Fan {
@@ -400,12 +402,18 @@ pub fn hwinfo_running() -> bool {
     })
 }
 
+/// True if our task exists and is the current version (older ones never re-enabled SensorsSM).
 pub fn task_installed() -> bool {
     std::process::Command::new("schtasks")
-        .args(["/query", "/tn", TASK_NAME])
+        .args(["/query", "/tn", TASK_NAME, "/xml"])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
-        .is_ok_and(|o| o.status.success())
+        .is_ok_and(|o| {
+            o.status.success()
+                && String::from_utf8_lossy(&o.stdout)
+                    .replace('\0', "")
+                    .contains(TASK_DESC)
+        })
 }
 
 /// Starts (or restarts) HWiNFO elevated via the task, without a UAC prompt.
@@ -438,8 +446,36 @@ fn base64(data: &[u8]) -> String {
     s
 }
 
-/// One-time setup (shows one UAC prompt): installs HWiNFO if needed, turns on its shared memory
-/// and tray-only start in the INI, and registers an on-demand task that (re)starts it elevated.
+/// PowerShell that turns on shared memory and tray-only start in `$exe`'s INI.
+const INI_PATCH: &str = r#"$ini = Join-Path (Split-Path $exe) 'HWiNFO64.INI'
+$want = [ordered]@{ SensorsOnly = '1'; SensorsSM = '1'; MinimalizeSensors = '1'; MinimalizeMainWnd = '1'; ShowWelcomeAndProgress = '0' }
+$lines = @(if (Test-Path $ini) { Get-Content $ini })
+if (-not ($lines -match '^\[Settings\]')) { $lines = @('[Settings]') + $lines }
+$out = New-Object System.Collections.Generic.List[string]
+$inSettings = $false
+foreach ($l in $lines) {
+  if ($l -match '^\[') {
+    if ($inSettings) { foreach ($k in $want.Keys) { $out.Add("$k=$($want[$k])") }; $want.Clear() }
+    $inSettings = ($l -eq '[Settings]')
+    $out.Add($l); continue
+  }
+  if ($inSettings -and $l -match '^([^=]+)=') { if ($want.Contains($matches[1])) { continue } }
+  $out.Add($l)
+}
+if ($inSettings) { foreach ($k in $want.Keys) { $out.Add("$k=$($want[$k])") } }
+Set-Content -Path $ini -Value $out -Encoding ASCII"#;
+
+/// Base64 UTF-16LE, as `powershell -EncodedCommand` expects.
+fn encode_ps(script: &str) -> String {
+    let utf16: Vec<u8> = script
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    base64(&utf16)
+}
+
+/// One-time setup (shows one UAC prompt): installs HWiNFO if needed and registers an on-demand
+/// task that (re)starts it elevated with shared memory and tray-only start enabled in its INI.
 pub fn setup_hwinfo() -> Result<(), String> {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
@@ -456,6 +492,16 @@ pub fn setup_hwinfo() -> Result<(), String> {
         .join("HWiNFO64.EXE")
     });
     let exe = exe.to_string_lossy().replace('\'', "''");
+    // HWiNFO rewrites its INI and can drop SensorsSM (e.g. when the free version's 12 h shared
+    // memory limit expires), so the task re-enables it on every (re)start, not just once here.
+    let start = encode_ps(&format!(
+        r#"$exe = '{exe}'
+Get-Process HWiNFO64 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process HWiNFO64 -ErrorAction SilentlyContinue | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
+{INI_PATCH}
+Start-Process $exe
+"#
+    ));
     let script = format!(
         r#"$ErrorActionPreference = 'Stop'
 $exe = '{exe}'
@@ -466,37 +512,16 @@ if ('{install}' -eq 'true' -and -not (Test-Path $exe)) {{
   if (-not (Test-Path $exe)) {{ exit 4 }}
   Get-Process HWiNFO64 -ErrorAction SilentlyContinue | Stop-Process -Force
 }}
-$ini = Join-Path (Split-Path $exe) 'HWiNFO64.INI'
-$want = [ordered]@{{ SensorsOnly = '1'; SensorsSM = '1'; MinimalizeSensors = '1'; MinimalizeMainWnd = '1'; ShowWelcomeAndProgress = '0' }}
-$lines = @(if (Test-Path $ini) {{ Get-Content $ini }})
-if (-not ($lines -match '^\[Settings\]')) {{ $lines = @('[Settings]') + $lines }}
-$out = New-Object System.Collections.Generic.List[string]
-$inSettings = $false
-foreach ($l in $lines) {{
-  if ($l -match '^\[') {{
-    if ($inSettings) {{ foreach ($k in $want.Keys) {{ $out.Add("$k=$($want[$k])") }}; $want.Clear() }}
-    $inSettings = ($l -eq '[Settings]')
-    $out.Add($l); continue
-  }}
-  if ($inSettings -and $l -match '^([^=]+)=') {{ if ($want.Contains($matches[1])) {{ continue }} }}
-  $out.Add($l)
-}}
-if ($inSettings) {{ foreach ($k in $want.Keys) {{ $out.Add("$k=$($want[$k])") }} }}
-Set-Content -Path $ini -Value $out -Encoding ASCII
-$action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument ('/c taskkill /f /im HWiNFO64.EXE >nul 2>&1 & start "" "' + $exe + '"')
+$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand {start}'
 $principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Highest
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
-Register-ScheduledTask -TaskName '{TASK_NAME}' -Action $action -Principal $principal -Settings $settings -Description 'Starts HWiNFO sensors for Vdisplay' -Force | Out-Null
+Register-ScheduledTask -TaskName '{TASK_NAME}' -Action $action -Principal $principal -Settings $settings -Description '{TASK_DESC}' -Force | Out-Null
 Start-ScheduledTask -TaskName '{TASK_NAME}'
 "#
     );
-    let utf16: Vec<u8> = script
-        .encode_utf16()
-        .flat_map(|u| u.to_le_bytes())
-        .collect();
     let params = format!(
         "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand {}",
-        base64(&utf16)
+        encode_ps(&script)
     );
     let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
     let (verb, file, args) = (wide("runas"), wide("powershell.exe"), wide(&params));
@@ -765,6 +790,13 @@ mod tests {
         assert!(matches!(parse_hwinfo(&b, 2000), HwinfoSnapshot::Stale));
         b[0..4].copy_from_slice(b"DEAD");
         assert!(matches!(parse_hwinfo(&b, 1005), HwinfoSnapshot::Inactive));
+    }
+
+    #[test]
+    fn ini_patch_braces() {
+        // INI_PATCH is spliced into a format! string as an argument, so its braces stay literal.
+        let s = format!("{INI_PATCH}");
+        assert!(s.contains("SensorsSM = '1'") && s.contains("$want.Clear() }"));
     }
 
     #[test]
