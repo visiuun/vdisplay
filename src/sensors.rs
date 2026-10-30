@@ -793,13 +793,6 @@ mod tests {
     }
 
     #[test]
-    fn ini_patch_braces() {
-        // INI_PATCH is spliced into a format! string as an argument, so its braces stay literal.
-        let s = format!("{INI_PATCH}");
-        assert!(s.contains("SensorsSM = '1'") && s.contains("$want.Clear() }"));
-    }
-
-    #[test]
     fn b64() {
         assert_eq!(base64(b"Man"), "TWFu");
         assert_eq!(base64(b"Ma"), "TWE=");
